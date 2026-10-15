@@ -1,0 +1,849 @@
+{
+  "name": "NGP-044 — Domain Expiry & DNS Watchdog",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "44 12 * * *"
+            }
+          ]
+        }
+      },
+      "id": "2abc0999-7193-4a4b-b7d2-51096b7b7619",
+      "name": "Daily 12:44 IST",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -2768,
+        -32
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://rdap.publicinterestregistry.org/rdap/domain/apache.org",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/rdap+json, application/json"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "ddfb626d-628c-4dff-8994-612362ff3d58",
+      "name": "Fetch RDAP",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -2496,
+        -32
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "url": "https://dns.google/resolve",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "name",
+              "value": "apache.org"
+            },
+            {
+              "name": "type",
+              "value": "NS"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "e5e070e7-aedf-4bf9-956e-3fd7845ba1c3",
+      "name": "Fetch NS Records",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -2288,
+        -32
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT input_sha256 FROM decision_audit ORDER BY id DESC LIMIT 1;",
+        "options": {}
+      },
+      "id": "43c31573-b236-48b2-977c-1818e6d13983",
+      "name": "Get Last Audit Hash",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -2064,
+        -32
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT expiry_date, nameservers_json, checked_at FROM domain_state WHERE domain = 'apache.org';",
+        "options": {}
+      },
+      "id": "78aca2c6-25a7-4f95-a26f-831d6de61c83",
+      "name": "Get Previous State",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -1840,
+        -32
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const DOMAIN = 'apache.org';\nconst TAG = 'NGP-044';\nconst THRESHOLD_DAYS = 24;\n\nconst errors = [];\nconst rdap = $('Fetch RDAP').first().json || {};\nconst dns = $('Fetch NS Records').first().json || {};\nconst prevState = $('Get Previous State').first().json || {};\nconst prevAudit = $('Get Last Audit Hash').first().json || {};\n\n// ---- Expiry from RDAP ----\nlet expiryDate = null;\nlet daysRemaining = null;\nconst ev = Array.isArray(rdap.events) ? rdap.events.find(e => e.eventAction === 'expiration') : null;\nif (!ev || !ev.eventDate) {\n  errors.push('RDAP expiration event missing');\n} else {\n  const exp = new Date(ev.eventDate);\n  if (isNaN(exp.getTime())) {\n    errors.push('RDAP expiration date unparseable');\n  } else {\n    const now = new Date();\n    const expUTC = Date.UTC(exp.getUTCFullYear(), exp.getUTCMonth(), exp.getUTCDate());\n    const nowUTC = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());\n    expiryDate = exp.toISOString();\n    daysRemaining = Math.round((expUTC - nowUTC) / 86400000);\n  }\n}\n\n// ---- Current NS from DNS-over-HTTPS ----\nlet currentNS = [];\nif (dns.Status !== 0 || !Array.isArray(dns.Answer)) {\n  errors.push('DNS NS lookup failed (status ' + dns.Status + ')');\n} else {\n  currentNS = [...new Set(\n    dns.Answer.filter(a => a.type === 2)\n      .map(a => String(a.data).toLowerCase().replace(/\\.$/, ''))\n  )].sort();\n  if (currentNS.length === 0) errors.push('No NS records returned');\n}\n\n// ---- Previous state ----\nlet previousNS = null;\nif (prevState.nameservers_json !== undefined && prevState.nameservers_json !== null) {\n  previousNS = typeof prevState.nameservers_json === 'string'\n    ? JSON.parse(prevState.nameservers_json)\n    : prevState.nameservers_json;\n  previousNS = [...previousNS].map(s => String(s).toLowerCase()).sort();\n}\nconst firstRun = previousNS === null;\nconst monitoringError = errors.length > 0;\nconst nsChanged = !monitoringError && !firstRun &&\n  JSON.stringify(previousNS) !== JSON.stringify(currentNS);\nconst expiryAlert = !monitoringError && daysRemaining < THRESHOLD_DAYS;\nconst alertRequired = expiryAlert || nsChanged;\nconst prevHash = prevAudit.input_sha256 || 'GENESIS';\n\n// Canonical JSON: fixed key order, so the same evidence always hashes the same.\nconst canonical = JSON.stringify({\n  tag: TAG, domain: DOMAIN, expiryDate, daysRemaining,\n  currentNS, previousNS, nsChanged, alertRequired,\n  monitoringError, errors, prevHash\n});\n\nconst evidenceText = [\n  'Domain: ' + DOMAIN,\n  'Expiry date (RDAP): ' + expiryDate,\n  'Days remaining: ' + daysRemaining,\n  'Current nameservers: ' + JSON.stringify(currentNS),\n  'Previous nameservers: ' + (firstRun ? 'none (first run baseline)' : JSON.stringify(previousNS)),\n  'Nameservers changed: ' + nsChanged,\n  'Expiry threshold: under ' + THRESHOLD_DAYS + ' days',\n  'Program alert decision (authoritative): ' + (alertRequired ? 'ALERT' : 'NO ALERT'),\n  'Monitoring errors: ' + (errors.length ? errors.join('; ') : 'none')\n].join('\\n');\n\nreturn [{ json: {\n  tag: TAG, domain: DOMAIN, expiryDate, daysRemaining, currentNS, previousNS,\n  firstRun, nsChanged, expiryAlert, alertRequired, monitoringError, errors,\n  prevHash, canonical, evidenceText\n}}];"
+      },
+      "id": "41b4fc30-513c-4ce0-b275-bc7a458265f5",
+      "name": "Normalize and Compare",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1616,
+        -32
+      ]
+    },
+    {
+      "parameters": {
+        "type": "SHA256",
+        "value": "={{ $json.canonical }}",
+        "dataPropertyName": "input_sha256"
+      },
+      "id": "198be3a9-ec84-40d7-8d97-09127c8ac19e",
+      "name": "Hash Input",
+      "type": "n8n-nodes-base.crypto",
+      "typeVersion": 1,
+      "position": [
+        -1408,
+        -32
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.evidenceText }}",
+        "options": {
+          "systemMessage": "You are the NGP-044 domain monitoring risk analyst.\n\nAnalyze the supplied evidence for apache.org.\n\nConsider:\n1. The number of days until expiry.\n2. Whether nameservers changed from the previous successful check.\n3. The operational risks supported by the evidence.\n4. A severity level: INFO, LOW, MEDIUM, HIGH, or CRITICAL.\n5. One recommended action.\n\nDo not invent registration data or claim a nameserver change without a valid previous state.\nThe program's alert decision is authoritative. Do not override it.\n\nRespond with ONE line only, in exactly this format:\n<SEVERITY> | <one-sentence explanation including the recommended action>"
+        }
+      },
+      "id": "284af602-187c-4aea-b9ab-195e6c4a6e2f",
+      "name": "AI Risk Analyst",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [
+        -1056,
+        -32
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "list",
+          "value": "claude-sonnet-4-6",
+          "cachedResultName": "Claude Sonnet 4.6"
+        },
+        "options": {
+          "temperature": 0
+        }
+      },
+      "id": "8b9c698c-f628-4266-80c7-a25585e3db86",
+      "name": "Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.6,
+      "position": [
+        -1040,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $('Hash Input').first().json;\nconst agent = $input.first().json || {};\nconst raw = String(agent.output || '').trim();\n\nconst LEVELS = ['INFO', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'];\n// Deterministic fallback severity (used if the AI is down or returns junk)\nlet fallback = 'INFO';\nif (d.monitoringError) fallback = 'HIGH';\nelse if (d.nsChanged) fallback = 'HIGH';\nelse if (d.daysRemaining < 7) fallback = 'CRITICAL';\nelse if (d.daysRemaining < 24) fallback = 'MEDIUM';\n\nlet severity = fallback;\nlet summary = '';\nconst m = raw.match(/^\\s*(INFO|LOW|MEDIUM|HIGH|CRITICAL)\\s*[|:\\-]\\s*([\\s\\S]+)$/i);\nif (m) { severity = m[1].toUpperCase(); summary = m[2]; }\nelse if (raw) { summary = raw; }\nsummary = summary.replace(/\\s+/g, ' ').trim();\nif (!summary) {\n  summary = d.monitoringError\n    ? 'Monitoring error: ' + d.errors.join('; ')\n    : d.daysRemaining + ' days to expiry; nameservers ' + (d.nsChanged ? 'changed' : 'unchanged') + ' (AI summary unavailable).';\n}\nif (summary.length > 300) summary = summary.slice(0, 297) + '...';\n\nconst verdict = d.monitoringError ? 'ERROR' : (d.alertRequired ? 'ALERT' : 'NO ALERT');\nconst ist = new Date(Date.now() + 5.5 * 3600 * 1000).toISOString().slice(0, 16).replace('T', ' ');\nconst executionId = String($execution.id);\n\nreturn [{ json: {\n  executionId,\n  timestampIst: ist + ' IST',\n  verdict, severity, summary,\n  modelOutput: raw || '(no model output)',\n  inputSha256: d.input_sha256,\n  prevHash: d.prevHash,\n  alertRequired: d.alertRequired,\n  monitoringError: d.monitoringError,\n  sendTelegram: d.alertRequired || d.monitoringError,\n  expiryDate: d.expiryDate,\n  nameserversJson: JSON.stringify(d.currentNS),\n  telegramText: '🟣 NGP-044 | exec #' + executionId + ' | ' + ist + ' IST | ' + verdict + ' / ' + severity + ' | ' + summary\n}}];"
+      },
+      "id": "9f727e8d-fd1a-4555-9fe2-3aa777f08832",
+      "name": "Format Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -832,
+        -32
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO decision_audit (execution_id, timestamp_ist, input_sha256, prev_hash, model_output, verdict, severity, summary) VALUES ($1,$2,$3,$4,$5,$6,$7,$8);",
+        "options": {
+          "queryReplacement": "={{ [$json.executionId, $json.timestampIst, $json.inputSha256, $json.prevHash, $json.modelOutput, $json.verdict, $json.severity, $json.summary] }}"
+        }
+      },
+      "id": "a7f88ca2-7820-47e3-b66f-80d9d4bac72d",
+      "name": "Save Audit Record",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -480,
+        -32
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO domain_state (domain, expiry_date, nameservers_json, checked_at) SELECT 'apache.org', $1::timestamptz, $2::jsonb, now() WHERE $3::boolean = false ON CONFLICT (domain) DO UPDATE SET expiry_date = EXCLUDED.expiry_date, nameservers_json = EXCLUDED.nameservers_json, checked_at = EXCLUDED.checked_at;",
+        "options": {
+          "queryReplacement": "={{ [$('Format Message').first().json.expiryDate, $('Format Message').first().json.nameserversJson, $('Format Message').first().json.monitoringError] }}"
+        }
+      },
+      "id": "7864cea9-8721-4425-929a-18b9d1fa45a8",
+      "name": "Save Current State",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -272,
+        -32
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $('Format Message').first().json.sendTelegram }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "28b0c6f4-3d65-49e5-906d-cb6a595a5eed",
+      "name": "Alert required?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -48,
+        -32
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ $('Format Message').first().json.telegramText }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "ccec7611-95e2-42a4-9978-1b4d3be6e4de",
+      "name": "Send Telegram Alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        176,
+        -112
+      ],
+      "webhookId": "b9e127f5-9866-4a6b-bd8d-385589175c26"
+    },
+    {
+      "parameters": {
+        "updates": [
+          "message"
+        ],
+        "additionalFields": {}
+      },
+      "id": "ccb16ad3-8e3b-4f99-8165-0e79c38dbf98",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -2336,
+        768
+      ],
+      "webhookId": "4e2940da-b8ab-4b03-9674-047818994960"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r-unauthorized",
+                    "leftValue": "={{ String($json.message && $json.message.from ? $json.message.from.id : '') }}",
+                    "rightValue": "YOUR_TELEGRAM_USER_ID",
+                    "operator": {
+                      "type": "string",
+                      "operation": "notEquals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "unauthorized"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r-status",
+                    "leftValue": "={{ ($json.message && $json.message.text ? $json.message.text : '').trim() }}",
+                    "rightValue": "^/status(@\\w+)?$",
+                    "operator": {
+                      "type": "string",
+                      "operation": "regex"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "status"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r-last",
+                    "leftValue": "={{ ($json.message && $json.message.text ? $json.message.text : '').trim() }}",
+                    "rightValue": "^/last(@\\w+)?\\s+([1-9]|[1-4][0-9]|50)$",
+                    "operator": {
+                      "type": "string",
+                      "operation": "regex"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "last"
+            }
+          ]
+        },
+        "looseTypeValidation": true,
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "unknown"
+        }
+      },
+      "id": "bd4913ae-f27b-47e5-99d7-9a7ff12ecd77",
+      "name": "Route Command",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        -2048,
+        736
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Command routing is done by the Switch node; this only identifies which branch ran.\nconst msg = $('Telegram Trigger').first().json.message || {};\nconst text = (msg.text || '').trim();\nconst userId = String(msg.from?.id ?? '');\nconst chatId = msg.chat?.id;\nlet command = 'unknown';\nif ($('Query Status').isExecuted) command = 'status';\nelse if ($('Query Last N').isExecuted) command = 'last';\nelse if (userId !== 'YOUR_TELEGRAM_USER_ID') command = 'unauthorized';\nlet error = '';\nif (command === 'unknown' && /^\\/last\\b/i.test(text)) {\n  const arg = text.split(/\\s+/)[1];\n  error = arg === undefined\n    ? 'Missing number. Use /last N where N is 1-50, e.g. /last 5.'\n    : 'Invalid N \"' + arg + '\". N must be a whole number from 1 to 50.';\n}\nconst p = { command, chatId, userId, text, error };\nconst rows = $input.all().map(i => i.json).filter(r => r && Object.keys(r).length);\nconst ist = new Date(Date.now() + 5.5 * 3600 * 1000).toISOString().slice(0, 16).replace('T', ' ');\nlet verdict = 'INFO', severity = 'INFO', summary = '';\n\nif (p.command === 'unauthorized') {\n  verdict = 'DENIED'; severity = 'LOW';\n  summary = 'You are not authorized to query this watchdog.';\n} else if (p.command === 'unknown') {\n  verdict = 'ERROR'; severity = 'LOW';\n  summary = p.error || 'Unknown command. Use /status or /last N (1-50).';\n} else if (p.command === 'status') {\n  verdict = 'STATUS';\n  if (!rows.length) { severity = 'LOW'; summary = 'No successful check recorded yet.'; }\n  else {\n    const r = rows[0];\n    const exp = new Date(r.expiry_date);\n    const now = new Date();\n    const days = Math.round((Date.UTC(exp.getUTCFullYear(), exp.getUTCMonth(), exp.getUTCDate()) -\n      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())) / 86400000);\n    const ns = typeof r.nameservers_json === 'string' ? JSON.parse(r.nameservers_json) : r.nameservers_json;\n    severity = days < 24 ? 'MEDIUM' : 'INFO';\n    summary = 'apache.org expires ' + exp.toISOString().slice(0, 10) + ' (' + days + ' days left); NS: ' +\n      ns.join(', ') + '; last successful check ' + new Date(new Date(r.checked_at).getTime() + 5.5 * 3600 * 1000).toISOString().slice(0, 16).replace('T', ' ') + ' IST.';\n  }\n} else if (p.command === 'last') {\n  verdict = 'HISTORY';\n  if (!rows.length) { severity = 'LOW'; summary = 'No audit records yet.'; }\n  else summary = 'Last ' + rows.length + ': ' +\n    rows.map(r => r.timestamp_ist + ' ' + r.verdict + '/' + r.severity).join(' ; ');\n}\nreturn [{ json: {\n  chatId: p.chatId,\n  executionId: String($execution.id),\n  timestampIst: ist + ' IST',\n  command: p.command,\n  rawText: p.text || '',\n  userId: p.userId,\n  verdict, severity, summary,\n  text: '🟣 NGP-044 | exec #' + $execution.id + ' | ' + ist + ' IST | ' + verdict + ' / ' + severity + ' | ' + summary\n}}];"
+      },
+      "id": "50237aef-0afc-41a9-a466-675cc2e36fd9",
+      "name": "Format Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1520,
+        768
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT input_sha256 FROM decision_audit ORDER BY id DESC LIMIT 1;",
+        "options": {}
+      },
+      "id": "072438bc-dc68-478f-850d-1e51d47ee2a1",
+      "name": "Get Last Audit Hash (Cmd)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -1296,
+        592
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $('Format Reply').first().json;\nconst prev = $input.first().json || {};\nconst prevHash = prev.input_sha256 || 'GENESIS';\n// Canonical JSON with fixed key order. Includes prevHash, so each entry chains to the one before it.\nconst canonical = JSON.stringify({\n  tag: 'NGP-044', kind: 'bot_command', executionId: r.executionId,\n  timestampIst: r.timestampIst, userId: r.userId, command: r.command,\n  rawText: r.rawText, verdict: r.verdict, severity: r.severity,\n  summary: r.summary, prevHash\n});\nreturn [{ json: {\n  executionId: r.executionId, timestampIst: r.timestampIst,\n  verdict: r.verdict, severity: r.severity, summary: r.summary,\n  modelOutput: 'n/a (bot command: ' + (r.rawText || '(empty)') + ', user ' + r.userId + ')',\n  prevHash, canonical\n}}];"
+      },
+      "id": "ef365f57-8488-439c-b78d-fcd98ca3c360",
+      "name": "Build Command Audit",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1104,
+        752
+      ]
+    },
+    {
+      "parameters": {
+        "type": "SHA256",
+        "value": "={{ $json.canonical }}",
+        "dataPropertyName": "input_sha256"
+      },
+      "id": "c4fa9032-637a-42a1-b625-59759a792e9f",
+      "name": "Hash Command Audit",
+      "type": "n8n-nodes-base.crypto",
+      "typeVersion": 1,
+      "position": [
+        -880,
+        752
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO decision_audit (execution_id, timestamp_ist, input_sha256, prev_hash, model_output, verdict, severity, summary) VALUES ($1,$2,$3,$4,$5,$6,$7,$8);",
+        "options": {
+          "queryReplacement": "={{ [$json.executionId, $json.timestampIst, $json.input_sha256, $json.prevHash, $json.modelOutput, $json.verdict, $json.severity, $json.summary] }}"
+        }
+      },
+      "id": "61f8c192-76be-4dce-a6d1-abf459ad84fc",
+      "name": "Save Command Audit",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -656,
+        752
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Format Reply').first().json.chatId }}",
+        "text": "={{ $('Format Reply').first().json.text }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "e877cd19-738e-48bb-9d15-49d2e54355a2",
+      "name": "Send Telegram Reply",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -1296,
+        768
+      ],
+      "webhookId": "226cfe68-fe4b-4158-98cb-5b2dc0cf9d08"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT expiry_date, nameservers_json, checked_at FROM domain_state WHERE domain = 'apache.org';",
+        "options": {}
+      },
+      "id": "db035124-92ed-48ae-ab68-c6e5d9209d2f",
+      "name": "Query Status",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -1776,
+        608
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT timestamp_ist, verdict, severity, summary FROM decision_audit ORDER BY id DESC LIMIT $1;",
+        "options": {
+          "queryReplacement": "={{ [parseInt($('Telegram Trigger').first().json.message.text.trim().split(' ').filter(Boolean)[1], 10)] }}"
+        }
+      },
+      "id": "44127e14-c940-41f6-ba44-5ff7819744e7",
+      "name": "Query Last N",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -1776,
+        752
+      ],
+      "alwaysOutputData": true
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Daily 12:44 IST": {
+      "main": [
+        [
+          {
+            "node": "Fetch RDAP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch RDAP": {
+      "main": [
+        [
+          {
+            "node": "Fetch NS Records",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch NS Records": {
+      "main": [
+        [
+          {
+            "node": "Get Last Audit Hash",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Last Audit Hash": {
+      "main": [
+        [
+          {
+            "node": "Get Previous State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Previous State": {
+      "main": [
+        [
+          {
+            "node": "Normalize and Compare",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize and Compare": {
+      "main": [
+        [
+          {
+            "node": "Hash Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hash Input": {
+      "main": [
+        [
+          {
+            "node": "AI Risk Analyst",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Risk Analyst": {
+      "main": [
+        [
+          {
+            "node": "Format Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Risk Analyst",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Message": {
+      "main": [
+        [
+          {
+            "node": "Save Audit Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Audit Record": {
+      "main": [
+        [
+          {
+            "node": "Save Current State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Current State": {
+      "main": [
+        [
+          {
+            "node": "Alert required?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert required?": {
+      "main": [
+        [
+          {
+            "node": "Send Telegram Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Route Command",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Command": {
+      "main": [
+        [
+          {
+            "node": "Format Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Query Status",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Query Last N",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Format Reply": {
+      "main": [
+        [
+          {
+            "node": "Get Last Audit Hash (Cmd)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Last Audit Hash (Cmd)": {
+      "main": [
+        [
+          {
+            "node": "Build Command Audit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Command Audit": {
+      "main": [
+        [
+          {
+            "node": "Hash Command Audit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hash Command Audit": {
+      "main": [
+        [
+          {
+            "node": "Save Command Audit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Command Audit": {
+      "main": [
+        [
+          {
+            "node": "Send Telegram Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query Status": {
+      "main": [
+        [
+          {
+            "node": "Format Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query Last N": {
+      "main": [
+        [
+          {
+            "node": "Format Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timezone": "Asia/Kolkata"
+  },
+  "meta": {},
+  "nodeGroups": [
+    {
+      "id": "675a452e-f45c-4f2a-bc92-93f0ed72b539",
+      "name": "Collect domain evidence",
+      "nodeIds": [
+        "ddfb626d-628c-4dff-8994-612362ff3d58",
+        "e5e070e7-aedf-4bf9-956e-3fd7845ba1c3",
+        "43c31573-b236-48b2-977c-1818e6d13983",
+        "78aca2c6-25a7-4f95-a26f-831d6de61c83",
+        "41b4fc30-513c-4ce0-b275-bc7a458265f5",
+        "198be3a9-ec84-40d7-8d97-09127c8ac19e"
+      ],
+      "description": "Pulls expiry and nameservers for apache.org, compares with the last check, and hashes the evidence into the audit chain"
+    },
+    {
+      "id": "2b986f55-8b9b-4dd7-850e-7ee02b343bbe",
+      "name": "Assess domain risk",
+      "nodeIds": [
+        "284af602-187c-4aea-b9ab-195e6c4a6e2f",
+        "8b9c698c-f628-4266-80c7-a25585e3db86",
+        "9f727e8d-fd1a-4555-9fe2-3aa777f08832"
+      ],
+      "description": "AI rates severity and writes a one-line summary; the program alert decision stays authoritative"
+    },
+    {
+      "id": "f99ab04f-921b-4e05-8ba3-655eb3e89f2c",
+      "name": "Record and alert",
+      "nodeIds": [
+        "a7f88ca2-7820-47e3-b66f-80d9d4bac72d",
+        "7864cea9-8721-4425-929a-18b9d1fa45a8",
+        "28b0c6f4-3d65-49e5-906d-cb6a595a5eed",
+        "ccec7611-95e2-42a4-9978-1b4d3be6e4de"
+      ],
+      "description": "Appends the hashed decision to the audit log, saves state, and pings Telegram only on expiry < 24 days or NS change"
+    },
+    {
+      "id": "737fe907-e9b9-430d-ade4-b9c584905582",
+      "name": "Answer bot commands",
+      "nodeIds": [
+        "bd4913ae-f27b-47e5-99d7-9a7ff12ecd77",
+        "db035124-92ed-48ae-ab68-c6e5d9209d2f",
+        "44127e14-c940-41f6-ba44-5ff7819744e7",
+        "50237aef-0afc-41a9-a466-675cc2e36fd9",
+        "072438bc-dc68-478f-850d-1e51d47ee2a1",
+        "ef365f57-8488-439c-b78d-fcd98ca3c360",
+        "c4fa9032-637a-42a1-b625-59759a792e9f",
+        "61f8c192-76be-4dce-a6d1-abf459ad84fc",
+        "e877cd19-738e-48bb-9d15-49d2e54355a2"
+      ],
+      "description": "Handles /status and /last N from allowed users, logs every reply as a hash-chained audit entry, then responds"
+    }
+  ],
+  "tags": []
+}
